@@ -1,0 +1,708 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#0d0716">
+    <title>轻轻，生日快乐</title>
+    <style>
+        html,
+        body {
+            margin: 0;
+            height: 100%;
+            overflow: hidden;
+            background: #0d0716;
+        }
+
+        canvas {
+            display: block;
+        }
+
+        /* 交互提示：出现后自动淡出，不长期干扰画面 */
+        #hint {
+            position: fixed;
+            left: 50%;
+            bottom: 28px;
+            transform: translateX(-50%);
+            font: 13px/1 "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+            letter-spacing: .22em;
+            color: rgba(255, 206, 232, .78);
+            pointer-events: none;
+            opacity: 0;
+            white-space: nowrap;
+            animation: hint-in 1.4s ease 1.6s forwards, hint-out 2s ease 8s forwards;
+        }
+
+        @keyframes hint-in {
+            to {
+                opacity: 1;
+            }
+        }
+
+        @keyframes hint-out {
+            to {
+                opacity: 0;
+            }
+        }
+
+        #fallback {
+            position: fixed;
+            inset: 0;
+            display: none;
+            place-items: center;
+            text-align: center;
+            padding: 24px;
+            color: #ffd7e8;
+            font: 15px/1.9 "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="hint">拖动旋转 · 滚轮缩放</div>
+    <div id="fallback">当前浏览器无法渲染 3D 场景<br>请更新浏览器或开启 WebGL 后重试</div>
+
+    <script type="module">
+        // 导入三维模型库 / 轨道控制库
+        import * as THREE from "https://cdn.skypack.dev/three@0.136.0";
+        import { OrbitControls } from "https://cdn.skypack.dev/three@0.136.0/examples/jsm/controls/OrbitControls";
+
+        // ==================== 1. 基础三件套 ====================
+        const BG_COLOR = 0x0d0716;
+
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(BG_COLOR);
+        // 指数雾：越远的星点越暗，制造纵深，让蛋糕从背景里浮出来
+        scene.fog = new THREE.FogExp2(BG_COLOR, 0.010);
+
+        let renderer;
+        try {
+            renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+        } catch (err) {
+            document.getElementById("fallback").style.display = "grid";
+            throw err;
+        }
+        // 高分屏必须显式设置 pixelRatio，否则 Retina 上整幅画面发虚
+        renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+        renderer.setSize(innerWidth, innerHeight);
+        // ACES 色调映射：把加法混合的过曝高光卷回可见范围，保住主体的明暗层次
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        renderer.toneMappingExposure = 1.15;
+        document.body.appendChild(renderer.domElement);
+
+        const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 1, 500);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.06;
+        controls.enablePan = false;          // 禁止平移，避免把主体拖出画面
+        controls.minDistance = 26;
+        controls.maxDistance = 80;
+        controls.minPolarAngle = 0.55;
+        controls.maxPolarAngle = 1.45;       // 不允许钻到盘子底下
+        controls.autoRotateSpeed = 0.35;
+
+        // —— 取景参数：由「文字不出画 + 蛋糕占画幅约 29% + 文字与火苗留 3 个世界单位」反算得到 ——
+        // —— 取景参数：按「整块蛋糕（含盘沿最前点）不出画 + 文字不出画 + 文字与火苗留 3 个世界单位」，
+        //    对真实点云做投影反算得到：蛋糕占画幅宽 28.2%，蛋糕 ndc y[-0.91, 0.46]，文字 ndc y[0.55, 0.86]
+        const CAM_TARGET = new THREE.Vector3(0, 1, 0);
+        const CAM_DIR = new THREE.Vector3(19.1, 13.4, 21.9).normalize();
+        const CAM_DIST = 35;
+        const DESIGN_ASPECT = 16 / 9;
+
+        let composer = null, gradePass = null, bloomPass = null;
+
+        const applyFraming = () => {
+            const aspect = innerWidth / innerHeight;
+            // 比设计比例更窄的窗口（例如手机竖屏）自动后撤相机，保证构图不被裁切
+            const fit = Math.max(1, DESIGN_ASPECT / aspect);
+            camera.position.copy(CAM_TARGET).addScaledVector(CAM_DIR, CAM_DIST * fit);
+            camera.aspect = aspect;
+            camera.updateProjectionMatrix();
+            controls.target.copy(CAM_TARGET);
+            renderer.setSize(innerWidth, innerHeight);
+            if (composer) {
+                composer.setSize(innerWidth, innerHeight);
+                if (gradePass) gradePass.uniforms.resolution.value.set(innerWidth, innerHeight);
+            }
+            controls.update();
+        };
+        applyFraming();
+        addEventListener("resize", applyFraming);
+
+        // ==================== 2. 点云材质 ====================
+        // gu.time 驱动粒子抖动；gu.ftime 驱动蜡烛火苗跳动
+        const gu = { time: { value: 0 }, ftime: { value: 0 } };
+
+        const createPointsMaterial = (mode, size) => new THREE.PointsMaterial({
+            size,
+            transparent: true,
+            depthTest: false,
+            blending: THREE.AdditiveBlending,
+            onBeforeCompile: shader => {
+                shader.uniforms.time = gu.time;
+                if (mode === "cake") shader.uniforms.ftime = gu.ftime;
+                shader.vertexShader = `
+                    uniform float time;
+                    attribute float sizes;
+                    attribute vec4 shift;
+                    ${mode === "cake" ? "uniform float ftime;\n                    attribute float glow;" : ""}
+                    varying vec3 vColor;
+                    ${shader.vertexShader}
+                `.replace(
+                    `gl_PointSize = size;`,
+                    `gl_PointSize = size * sizes${mode === "cake" ? " * flick" : ""};`
+                ).replace(
+                    `#include <color_vertex>`,
+                    mode === "cake"
+                        ? `#include <color_vertex>
+                    // 每根蜡烛按自己的相位做 8–12Hz 呼吸跳动
+                    float flick = 1.0;
+                    if (glow > 0.0) {
+                        flick = 0.86 + 0.16 * sin(ftime * 11.0 + glow * 6.2831)
+                                      + 0.10 * sin(ftime * 21.7 + glow * 15.7);
+                    }
+                    vColor = pcolor * flick;`
+                        : `#include <color_vertex>
+                    float d = clamp(length(abs(position) / vec3(50., 42., 50.)), 0., 1.);
+                    vColor = mix(vec3(122., 46., 108.), vec3(60., 40., 142.), d) / 255.;`
+                ).replace(
+                    `#include <begin_vertex>`,
+                    `#include <begin_vertex>
+                    float t = time;
+                    float moveT = mod(shift.x + shift.z * t, PI2);
+                    float moveS = mod(shift.y + shift.z * t, PI2);
+                    transformed += vec3(cos(moveS) * sin(moveT), cos(moveT), sin(moveS) * sin(moveT)) * shift.w;`
+                );
+                shader.fragmentShader = `
+                    varying vec3 vColor;
+                    ${shader.fragmentShader}
+                `.replace(
+                    `#include <clipping_planes_fragment>`,
+                    `#include <clipping_planes_fragment>
+                    float d = length(gl_PointCoord.xy - 0.5);`
+                ).replace(
+                    `vec4 diffuseColor = vec4( diffuse, opacity );`,
+                    `vec4 diffuseColor = vec4(vColor, smoothstep(0.5, 0.1, d));`
+                );
+            }
+        });
+
+        const bgMaterial = createPointsMaterial("bg", 0.10);     // 背景：压暗，退到后面当氛围
+        const cakeMaterial = createPointsMaterial("cake", 0.115); // 主体：更亮更实
+
+        // ==================== 3. 背景：柔光壳 + 细光环 + 星野 ====================
+        const pushShift = (arr, wobble) => {
+            arr.push(
+                Math.random() * Math.PI,
+                Math.random() * Math.PI * 2,
+                (Math.random() * 0.9 + 0.1) * Math.PI * 0.1,
+                wobble * (0.4 + Math.random() * 0.6)
+            );
+        };
+
+        // 球壳：包在蛋糕外侧的一层柔光（半径必须大于蛋糕最外沿，避免穿模）
+        const createShellPoints = (num, rMin, rMax) => {
+            const pts = [], sizes = [], shift = [];
+            for (let i = 0; i < num; i++) {
+                pts.push(new THREE.Vector3().randomDirection().multiplyScalar(rMin + Math.random() * (rMax - rMin)));
+                sizes.push(Math.random() * 0.5 + 0.4);
+                pushShift(shift, 0.6);
+            }
+            return { pts, sizes, shift };
+        };
+
+        // 细光环：保留原设计的环，但半径外扩到蛋糕之外、密度减半，不再过曝成纯白硬边
+        const createRingPoints = (num, innerRadius, outerRadius) => {
+            const pts = [], sizes = [], shift = [];
+            for (let i = 0; i < num; i++) {
+                const rand = Math.pow(Math.random(), 1.5);
+                const radius = Math.sqrt(outerRadius * outerRadius * rand + (1 - rand) * innerRadius * innerRadius);
+                pts.push(new THREE.Vector3().setFromCylindricalCoords(
+                    radius,
+                    Math.random() * 2 * Math.PI,
+                    (Math.random() - 0.5) * 1.8
+                ));
+                sizes.push(Math.random() * 0.5 + 0.4);
+                pushShift(shift, 0.6);
+            }
+            return { pts, sizes, shift };
+        };
+
+        // 星野：把原来一坨实心盘的脏噪声换成稀疏星点，少量亮星拉开层次
+        const createStarField = (num, innerRadius, outerRadius) => {
+            const pts = [], sizes = [], shift = [];
+            for (let i = 0; i < num; i++) {
+                const a = Math.random() * Math.PI * 2;
+                const r = innerRadius + (outerRadius - innerRadius) * Math.pow(Math.random(), 0.8);
+                pts.push(new THREE.Vector3(
+                    Math.cos(a) * r,
+                    (Math.random() - 0.5) * 4,
+                    Math.sin(a) * r
+                ));
+                sizes.push(Math.random() < 0.05 ? Math.random() * 1.6 + 1.8 : Math.random() * 0.6 + 0.35);
+                pushShift(shift, 0.8);
+            }
+            return { pts, sizes, shift };
+        };
+
+        const toGeometry = (data) => {
+            const g = new THREE.BufferGeometry().setFromPoints(data.pts);
+            g.setAttribute("sizes", new THREE.Float32BufferAttribute(data.sizes, 1));
+            g.setAttribute("shift", new THREE.Float32BufferAttribute(data.shift, 4));
+            return g;
+        };
+
+        const shellPoints = new THREE.Points(toGeometry(createShellPoints(55000, 16.4, 17.1)), bgMaterial);
+        const ringPoints1 = new THREE.Points(toGeometry(createRingPoints(30000, 17.8, 18.0)), bgMaterial);
+        const ringPoints2 = new THREE.Points(toGeometry(createRingPoints(30000, 18.5, 18.7)), bgMaterial);
+        const ringPoints3 = new THREE.Points(toGeometry(createRingPoints(30000, 19.2, 19.4)), bgMaterial);
+        const starPoints = new THREE.Points(toGeometry(createStarField(45000, 21, 50)), bgMaterial);
+
+        // ==================== 4. 生日蛋糕点云 ====================
+        const cakePts = [], cakeSizes = [], cakeColors = [], cakeShift = [], cakeGlow = [];
+
+        // 配色：深梅紫底 × 奶油白 / 玫瑰粉 / 金棕 × 金橙火苗，全场收敛到三个色族
+        const CAKE = {
+            plate: new THREE.Color(0.58, 0.64, 0.92),
+            plateRim: new THREE.Color(0.92, 0.96, 1.00),
+            sponge: new THREE.Color(0.78, 0.48, 0.22),
+            frosting: new THREE.Color(1.00, 0.62, 0.78),
+            cream: new THREE.Color(1.00, 0.95, 0.82),
+            cherry: new THREE.Color(0.90, 0.12, 0.22),
+            stem: new THREE.Color(0.35, 0.55, 0.22),
+            candle: new THREE.Color(1.00, 0.98, 0.90),
+            stripe: new THREE.Color(1.00, 0.36, 0.48),
+            flameCore: new THREE.Color(1.00, 0.97, 0.72),
+            flameMid: new THREE.Color(1.00, 0.76, 0.28),
+            flameOuter: new THREE.Color(1.00, 0.44, 0.10)
+        };
+
+        const SPRINKLE_COLORS = [
+            new THREE.Color(1.00, 0.42, 0.52),
+            new THREE.Color(0.50, 0.86, 1.00),
+            new THREE.Color(1.00, 0.90, 0.40),
+            new THREE.Color(0.70, 1.00, 0.56),
+            new THREE.Color(1.00, 0.64, 1.00)
+        ];
+
+        // 假光照：点云没有真正的法线光照，在 CPU 端算好明暗写进顶点色，柱面立刻有体积感
+        const KEY_DIR = new THREE.Vector3(0.62, 0.60, 0.50).normalize();   // 主光：画面右上前方
+        const RIM_DIR = new THREE.Vector3(-0.70, 0.25, 0.67).normalize();  // 轮廓光：左前方，勾边
+        const AMBIENT = 0.20;
+
+        const shade = (color, n) => {
+            if (!n) return color;                     // 自发光（火苗）不参与光照
+            const key = Math.max(0, n.dot(KEY_DIR));
+            const rim = Math.max(0, n.dot(RIM_DIR));
+            const l = AMBIENT + 0.95 * key + 0.40 * rim * rim * rim;
+            return new THREE.Color(
+                Math.min(1, color.r * l),
+                Math.min(1, color.g * l),
+                Math.min(1, color.b * l)
+            );
+        };
+
+        const addCakePoint = (x, y, z, color, size, wobble, normal, glow) => {
+            const c = shade(color, normal);
+            cakePts.push(new THREE.Vector3(x, y, z));
+            cakeSizes.push(size);
+            cakeColors.push(c.r, c.g, c.b);
+            cakeGlow.push(glow || 0);
+            cakeShift.push(
+                Math.random() * Math.PI,
+                Math.random() * Math.PI * 2,
+                (Math.random() * 0.9 + 0.1) * Math.PI * 0.1,
+                wobble * (0.4 + Math.random() * 0.6)
+            );
+        };
+
+        const TAU = Math.PI * 2;
+        const pick = (c, a, b) => (typeof c === "function" ? c(a, b) : c);
+
+        // 圆柱侧面
+        const addSide = (num, radius, y0, y1, colorOrFn, wobble) => {
+            for (let i = 0; i < num; i++) {
+                const a = Math.random() * TAU;
+                const y = y0 + Math.random() * (y1 - y0);
+                addCakePoint(
+                    Math.cos(a) * radius, y, Math.sin(a) * radius,
+                    pick(colorOrFn, a, y), Math.random() * 1.1 + 0.5, wobble,
+                    new THREE.Vector3(Math.cos(a), 0, Math.sin(a))
+                );
+            }
+        };
+
+        // 圆盘 / 圆环面（顶面）
+        const addDisc = (num, inner, outer, y, colorOrFn, wobble, normal) => {
+            const n = normal || new THREE.Vector3(0, 1, 0);
+            for (let i = 0; i < num; i++) {
+                const a = Math.random() * TAU;
+                const r = Math.sqrt(inner * inner + Math.random() * (outer * outer - inner * inner));
+                addCakePoint(
+                    Math.cos(a) * r, y + (Math.random() - 0.5) * 0.2, Math.sin(a) * r,
+                    pick(colorOrFn, a, r), Math.random() * 1.1 + 0.5, wobble, n
+                );
+            }
+        };
+
+        // 边缘垂下的奶油：波浪形滴落，末端挂一颗奶油珠
+        const addDrips = (num, radius, topY, minLen, maxLen, lobes, color, wobble) => {
+            for (let i = 0; i < num; i++) {
+                const a = Math.random() * TAU;
+                const wave = 0.5 + 0.5 * Math.sin(a * lobes);
+                const len = minLen + (maxLen - minLen) * wave;
+                const y = topY - Math.random() * len;
+                const r = radius + 0.14;
+                addCakePoint(
+                    Math.cos(a) * r, y, Math.sin(a) * r, color,
+                    Math.random() * 1.0 + 0.5, wobble,
+                    new THREE.Vector3(Math.cos(a), 0, Math.sin(a))
+                );
+                if (Math.random() < 0.014) {                       // 滴落末端的挂珠
+                    const ba = Math.random() * TAU, bb = Math.random() * TAU;
+                    const br = 0.22 * Math.sqrt(Math.random());
+                    const n = new THREE.Vector3(
+                        Math.cos(ba) * Math.sin(bb), Math.cos(bb), Math.sin(ba) * Math.sin(bb)
+                    );
+                    addCakePoint(
+                        Math.cos(a) * (radius + 0.2) + n.x * br,
+                        topY - len + n.y * br,
+                        Math.sin(a) * (radius + 0.2) + n.z * br,
+                        color, Math.random() * 0.9 + 0.5, wobble * 0.6, n
+                    );
+                }
+            }
+        };
+
+        // 一根蜡烛 + 火苗；火苗带 glow 序号，由 shader 做不同相位的跳动
+        const addCandle = (cx, cz, baseY, height, radius, numSide, numFlame, phase) => {
+            for (let i = 0; i < numSide; i++) {
+                const a = Math.random() * TAU;
+                const k = Math.random();
+                const y = baseY + k * height;
+                const base = Math.floor(k * height / 0.72) % 2 === 0 ? CAKE.candle : CAKE.stripe;
+                const dim = 0.88 + 0.12 * (1 - k);                 // 蜡烛上下轻微渐隐
+                addCakePoint(
+                    cx + Math.cos(a) * radius, y, cz + Math.sin(a) * radius,
+                    new THREE.Color(base.r * dim, base.g * dim, base.b * dim),
+                    Math.random() * 0.9 + 0.5, 0.06,
+                    new THREE.Vector3(Math.cos(a), 0, Math.sin(a))
+                );
+            }
+            const flameBase = baseY + height + 0.22;
+            const flameH = 1.75 + Math.random() * 0.35;
+            for (let i = 0; i < numFlame; i++) {
+                const h = Math.pow(Math.random(), 0.7);             // 0 = 火苗根，1 = 火苗尖
+                const profile = Math.pow(Math.sin(Math.PI * (0.12 + h * 0.86)), 0.85);
+                const fr = 0.40 * profile * (1 - h * 0.22);
+                const a = Math.random() * TAU;
+                const rr = fr * (0.35 + 0.65 * Math.sqrt(Math.random()));
+                const color = h < 0.4 ? CAKE.flameCore : (h < 0.75 ? CAKE.flameMid : CAKE.flameOuter);
+                addCakePoint(
+                    cx + Math.cos(a) * rr, flameBase + h * flameH, cz + Math.sin(a) * rr,
+                    color, Math.random() * 1.3 + 0.7, 0.22, null, phase
+                );
+            }
+        };
+
+        // 顶部奶油漩涡（螺旋上升的小山）
+        const addCreamSwirl = (num, maxR, baseY) => {
+            for (let i = 0; i < num; i++) {
+                const t = Math.pow(Math.random(), 0.75);
+                const a = t * TAU * 2.6 + (Math.random() - 0.5) * 0.5;
+                const r = maxR * t;
+                const y = baseY + (1 - t) * 0.62 + (Math.random() - 0.5) * 0.16;
+                addCakePoint(
+                    Math.cos(a) * r, y, Math.sin(a) * r, CAKE.cream,
+                    Math.random() * 1.0 + 0.6, 0.06,
+                    new THREE.Vector3(Math.cos(a) * 0.55, 1, Math.sin(a) * 0.55).normalize()
+                );
+            }
+        };
+
+        // 樱桃：球面点云，带一点镜面高光 + 果柄
+        const addCherry = (cx, cy, cz, radius, num) => {
+            for (let i = 0; i < num; i++) {
+                const u = Math.random() * TAU;
+                const v = Math.acos(2 * Math.random() - 1);
+                const n = new THREE.Vector3(
+                    Math.sin(v) * Math.cos(u), Math.cos(v), Math.sin(v) * Math.sin(u)
+                );
+                const c = shade(CAKE.cherry, n);
+                const spec = Math.pow(Math.max(0, n.dot(KEY_DIR)), 16) * 0.9;
+                addCakePoint(
+                    cx + n.x * radius, cy + n.y * radius, cz + n.z * radius,
+                    new THREE.Color(
+                        Math.min(1, c.r + spec),
+                        Math.min(1, c.g + spec * 0.85),
+                        Math.min(1, c.b + spec * 0.80)
+                    ),
+                    Math.random() * 1.1 + 0.6, 0.05, null
+                );
+            }
+            for (let i = 0; i < 60; i++) {
+                addCakePoint(
+                    cx + (Math.random() - 0.5) * 0.12,
+                    cy + radius * 0.9 + Math.random() * 0.8,
+                    cz + (Math.random() - 0.5) * 0.12,
+                    CAKE.stem, Math.random() * 0.8 + 0.4, 0.04, null
+                );
+            }
+        };
+
+        // 一根彩色糖粒
+        const addSprinkle = (innerR, outerR, y) => {
+            const a = Math.random() * TAU;
+            const r = Math.sqrt(innerR * innerR + Math.random() * (outerR * outerR - innerR * innerR));
+            const px = Math.cos(a) * r, pz = Math.sin(a) * r;
+            const dir = Math.random() * TAU, len = 0.5 + Math.random() * 0.45;
+            const color = SPRINKLE_COLORS[Math.floor(Math.random() * SPRINKLE_COLORS.length)];
+            for (let i = 0; i < 30; i++) {
+                const k = Math.random();
+                addCakePoint(
+                    px + Math.cos(dir) * len * k, y + 0.1, pz + Math.sin(dir) * len * k,
+                    color, Math.random() * 1.0 + 0.6, 0.04, new THREE.Vector3(0, 1, 0)
+                );
+            }
+        };
+
+        // ---- 蛋糕尺寸 ----
+        const PLATE_R = 11.2, PLATE_Y = -11.2;
+        const R1 = 10.0, Y_BOTTOM = -10.85, Y_TIER1 = -2.4;
+        const R2 = 6.6, Y_TIER2 = 4.18;
+
+        // 盘子 + 盘沿高光
+        addDisc(22000, 0, PLATE_R, PLATE_Y + 0.35, CAKE.plate, 0.06);
+        addSide(5000, PLATE_R, PLATE_Y, PLATE_Y + 0.35, CAKE.plate, 0.05);
+        addDisc(3500, PLATE_R - 0.75, PLATE_R - 0.35, PLATE_Y + 0.38, CAKE.plateRim, 0.03);
+
+        // 下层：下段蛋糕胚，上段奶油，顶部奶油滴落
+        addSide(48000, R1, Y_BOTTOM, Y_TIER1,
+            (a, y) => (y < Y_BOTTOM + 3.6 ? CAKE.sponge : CAKE.frosting), 0.14);
+        addDisc(20000, R2, R1, Y_TIER1, CAKE.frosting, 0.12);
+        addDrips(11000, R1, Y_TIER1, 1.0, 2.4, 9, CAKE.frosting, 0.18);
+
+        // 上层
+        addSide(28000, R2, Y_TIER1, Y_TIER2,
+            (a, y) => (y < Y_TIER1 + 1.5 ? CAKE.sponge : CAKE.frosting), 0.12);
+        addDisc(14000, 0, R2, Y_TIER2, CAKE.frosting, 0.10);
+        addDrips(9000, R2, Y_TIER2, 0.8, 1.9, 7, CAKE.frosting, 0.16);
+
+        // 顶部奶油漩涡 + 樱桃
+        addCreamSwirl(9000, 3.0, Y_TIER2 + 0.1);
+        addCherry(0, Y_TIER2 + 1.75, 0, 0.95, 7000);
+
+        // 5 根蜡烛围成一圈
+        for (let i = 0; i < 5; i++) {
+            const a = (i / 5) * TAU + Math.PI / 10;
+            addCandle(Math.cos(a) * 4.3, Math.sin(a) * 4.3, Y_TIER2, 3.0, 0.34, 4200, 5200, i + 1);
+        }
+
+        // 彩色糖粒
+        for (let i = 0; i < 120; i++) addSprinkle(3.4, R2 - 0.6, Y_TIER2 + 0.05);
+        for (let i = 0; i < 150; i++) addSprinkle(R2 + 0.5, R1 - 0.5, Y_TIER1 + 0.15);
+
+        // 蛋糕几何体：逐点颜色 + 火苗标记
+        const cakeGeometry = new THREE.BufferGeometry().setFromPoints(cakePts);
+        cakeGeometry.setAttribute("sizes", new THREE.Float32BufferAttribute(cakeSizes, 1));
+        cakeGeometry.setAttribute("shift", new THREE.Float32BufferAttribute(cakeShift, 4));
+        cakeGeometry.setAttribute("pcolor", new THREE.Float32BufferAttribute(cakeColors, 3));
+        cakeGeometry.setAttribute("glow", new THREE.Float32BufferAttribute(cakeGlow, 1));
+
+        const cakePoints = new THREE.Points(cakeGeometry, cakeMaterial);
+        cakePoints.renderOrder = 1;
+
+        // ==================== 5. 文字：两行中文，悬在蛋糕正上方 ====================
+        // helvetiker 字体没有中文字形，所以用 canvas 画字再贴到 Sprite 上；
+        // Sprite 始终面向相机，任意旋转视角下文字都清晰可读。
+        const TEXT_LINES = ["Jane", "生日快乐"];
+        const TEXT_WORLD_WIDTH = 9.5;                       // 第二行字宽（世界单位，约蛋糕直径的 43%）
+        const TEXT_POS = new THREE.Vector3(0, 14.3, 0);     // 蛋糕正上方（与火苗留 3 个世界单位呼吸区）
+        const TEXT_RISE_FROM = 11.9;                        // 入场起点：从蛋糕里浮上来
+
+        const createBirthdayTextSprite = (lines) => {
+            const FONT_STACK = '"PingFang SC", "Hiragino Sans GB", "Heiti SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif';
+            const HERO = 200, SECOND = 132, GAP = 22, PAD = 60, TRACK = 16;
+            const FONT_STACK_LATIN = '"Helvetica Neue", "Segoe UI", Arial';
+            const fonts = [`600 ${SECOND}px ${FONT_STACK_LATIN}, ${FONT_STACK}`, `800 ${HERO}px ${FONT_STACK}`];
+
+            const canvas = document.createElement("canvas");
+            const ctx = canvas.getContext("2d");
+
+            // 逐字绘制实现字距（ctx.letterSpacing 兼容性不足）
+            const layout = lines.map((line, i) => {
+                ctx.font = fonts[i];
+                const chars = [...line];
+                const widths = chars.map(ch => ctx.measureText(ch).width);
+                const width = widths.reduce((s, w) => s + w, 0) + TRACK * (chars.length - 1);
+                return { chars, widths, width, font: fonts[i] };
+            });
+
+            const contentW = Math.max(...layout.map(l => l.width));
+            const contentH = SECOND + GAP + HERO;
+            canvas.width = Math.ceil(contentW + PAD * 2);
+            canvas.height = Math.ceil(contentH + PAD * 2);
+            const cw = canvas.width, ch = canvas.height;
+
+            // 暖金色渐变 + 柔和外发光：与紫调背景形成冷暖对比
+            const grad = ctx.createLinearGradient(0, PAD, 0, ch - PAD);
+            grad.addColorStop(0, "#fff8e4");
+            grad.addColorStop(0.5, "#ffd894");
+            grad.addColorStop(1, "#ffb066");
+
+            ctx.textAlign = "center";
+            ctx.textBaseline = "middle";
+            ctx.shadowColor = "rgba(255, 168, 96, 0.95)";
+            ctx.shadowBlur = 42;
+            ctx.fillStyle = grad;
+
+            let baseline = PAD;
+            layout.forEach((l, i) => {
+                const lineH = i === 0 ? SECOND : HERO;
+                const cy = baseline + lineH / 2;
+                ctx.font = l.font;
+                let x = cw / 2 - l.width / 2;
+                l.chars.forEach((char, k) => {
+                    ctx.fillText(char, x + l.widths[k] / 2, cy);
+                    ctx.fillText(char, x + l.widths[k] / 2, cy);   // 叠画一次，让光晕更实
+                    x += l.widths[k] + TRACK;
+                });
+                baseline += lineH + GAP;
+            });
+
+            const texture = new THREE.CanvasTexture(canvas);
+            texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+
+            const sprite = new THREE.Sprite(new THREE.SpriteMaterial({
+                map: texture,
+                transparent: true,
+                depthTest: false,
+                depthWrite: false,
+                opacity: 0
+            }));
+            const spriteW = TEXT_WORLD_WIDTH * (canvas.width / layout[1].width);
+            sprite.scale.set(spriteW, spriteW * (canvas.height / canvas.width), 1);
+            return sprite;
+        };
+
+        const birthdayText = createBirthdayTextSprite(TEXT_LINES);
+        birthdayText.position.copy(TEXT_POS);
+        birthdayText.renderOrder = 10;                      // 永远压在最上层
+
+        // ==================== 6. 入场景 ====================
+        [shellPoints, ringPoints1, ringPoints2, ringPoints3, starPoints].forEach(p => {
+            p.rotation.order = "ZYX";
+            p.renderOrder = 0;
+            scene.add(p);
+        });
+        scene.add(cakePoints);
+        scene.add(birthdayText);
+
+        // ==================== 7. 后处理：辉光 + 暗角 + 颗粒 ====================
+        const GradeShader = {
+            uniforms: {
+                tDiffuse: { value: null },
+                time: { value: 0 },
+                resolution: { value: new THREE.Vector2(1, 1) }
+            },
+            vertexShader: `
+                varying vec2 vUv;
+                void main() {
+                    vUv = uv;
+                    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                }`,
+            fragmentShader: `
+                uniform sampler2D tDiffuse;
+                uniform float time;
+                uniform vec2 resolution;
+                varying vec2 vUv;
+                void main() {
+                    vec4 color = texture2D(tDiffuse, vUv);
+                    // 暗角：把视线收拢到画面中心的蛋糕
+                    vec2 p = (vUv - 0.5) * vec2(resolution.x / resolution.y, 1.0);
+                    float vig = smoothstep(1.05, 0.25, length(p));
+                    color.rgb *= mix(0.55, 1.0, vig);
+                    // 极轻的胶片颗粒，避免大面积纯色显得塑料
+                    float grain = fract(sin(dot(vUv * resolution + time, vec2(12.9898, 78.233))) * 43758.5453);
+                    color.rgb += (grain - 0.5) * 0.022;
+                    gl_FragColor = color;
+                }`
+        };
+
+        // 动态导入后处理模块：任何一环失败都自动回退到直接渲染，不让整页白屏
+        try {
+            const [EC, RP, UB, SP] = await Promise.all([
+                import("https://cdn.skypack.dev/three@0.136.0/examples/jsm/postprocessing/EffectComposer.js"),
+                import("https://cdn.skypack.dev/three@0.136.0/examples/jsm/postprocessing/RenderPass.js"),
+                import("https://cdn.skypack.dev/three@0.136.0/examples/jsm/postprocessing/UnrealBloomPass.js"),
+                import("https://cdn.skypack.dev/three@0.136.0/examples/jsm/postprocessing/ShaderPass.js")
+            ]);
+
+            composer = new EC.EffectComposer(renderer);
+            composer.setPixelRatio(renderer.getPixelRatio());
+            composer.setSize(innerWidth, innerHeight);
+            composer.addPass(new RP.RenderPass(scene, camera));
+
+            bloomPass = new UB.UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.85, 0.55, 0.72);
+            composer.addPass(bloomPass);
+
+            gradePass = new SP.ShaderPass(GradeShader);
+            gradePass.uniforms.resolution.value.set(innerWidth, innerHeight);
+            composer.addPass(gradePass);
+
+            applyFraming();     // 同步一次尺寸
+        } catch (err) {
+            console.warn("[bloom] 后处理不可用，已回退到直接渲染：", err);
+        }
+
+        // ==================== 8. 渲染循环 ====================
+        const clock = new THREE.Clock();
+
+        // 用户交互时暂停自动旋转，静止 3.2 秒后再缓慢转起来
+        let lastInteraction = performance.now();
+        const markInteraction = () => {
+            lastInteraction = performance.now();
+            controls.autoRotate = false;
+        };
+        controls.addEventListener("start", markInteraction);
+        controls.addEventListener("end", markInteraction);
+
+        renderer.setAnimationLoop(() => {
+            const elapsed = clock.getElapsedTime();
+            const t = elapsed * 0.5;
+
+            gu.time.value = t * Math.PI;
+            gu.ftime.value = elapsed;
+
+            if (!controls.autoRotate && performance.now() - lastInteraction > 3200) controls.autoRotate = true;
+            controls.update();
+
+            // 背景各层不同速度自转，形成视差
+            shellPoints.rotation.y = t * 0.08;
+            ringPoints1.rotation.z = t * 0.55;
+            ringPoints2.rotation.x = t * 0.34;
+            ringPoints3.rotation.y = t * 0.20;
+            ringPoints3.rotation.z = t * 0.14;
+            starPoints.rotation.y = t * 0.12;
+
+            // 文字：0.4s 后淡入并上浮到位，之后轻微呼吸浮动
+            const appear = Math.min(1, Math.max(0, (elapsed - 0.4) / 1.1));
+            const ease = 1 - Math.pow(1 - appear, 3);
+            birthdayText.material.opacity = 0.96 * ease;
+            birthdayText.position.y = TEXT_RISE_FROM + (TEXT_POS.y - TEXT_RISE_FROM) * ease
+                + Math.sin(elapsed * 1.15) * 0.16 * ease;
+
+            if (composer) {
+                if (gradePass) gradePass.uniforms.time.value = elapsed;
+                composer.render();
+            } else {
+                renderer.render(scene, camera);
+            }
+        });
+    </script>
+</body>
+
+</html>
